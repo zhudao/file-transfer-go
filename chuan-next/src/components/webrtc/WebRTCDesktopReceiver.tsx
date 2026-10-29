@@ -8,6 +8,9 @@ import { useToast } from '@/components/ui/toast-simple';
 import { useDesktopShareBusiness } from '@/hooks/desktop-share';
 import DesktopViewer from '@/components/DesktopViewer';
 import { ConnectionStatus } from '@/components/ConnectionStatus';
+import VoiceChatPanel from '@/components/VoiceChatPanel';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { validateRoomCode, checkRoomStatus, handleNetworkError } from '@/lib/room-utils';
 
 interface WebRTCDesktopReceiverProps {
   className?: string;
@@ -19,6 +22,7 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
   const [inputCode, setInputCode] = useState(initialCode || '');
   const [isLoading, setIsLoading] = useState(false);
   const [isJoiningRoom, setIsJoiningRoom] = useState(false); // 添加加入房间状态
+  const [showPeerLeftDialog, setShowPeerLeftDialog] = useState(false); // 发送方退出提示
   const hasTriedAutoJoin = React.useRef(false); // 添加 ref 来跟踪是否已尝试自动加入
   const { showToast } = useToast();
 
@@ -37,8 +41,9 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
     const trimmedCode = inputCode.trim();
     
     // 检查房间代码格式
-    if (!trimmedCode || trimmedCode.length !== 6) {
-      showToast('请输入正确的6位房间代码', "error");
+    const validationError = validateRoomCode(trimmedCode);
+    if (validationError) {
+      showToast(validationError, "error");
       return;
     }
 
@@ -53,35 +58,9 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
     try {
       console.log('[DesktopShareReceiver] 开始验证房间状态...');
       
-      // 先检查房间状态
-      const response = await fetch(`/api/room-info?code=${trimmedCode}`);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: 无法检查房间状态`);
-      }
-      
-      const result = await response.json();
-      
+      const result = await checkRoomStatus(trimmedCode);
       if (!result.success) {
-        let errorMessage = result.message || '房间不存在或已过期';
-        if (result.message?.includes('expired')) {
-          errorMessage = '房间已过期，请联系发送方重新创建';
-        } else if (result.message?.includes('not found')) {
-          errorMessage = '房间不存在，请检查房间代码是否正确';
-        }
-        showToast(errorMessage, "error");
-        return;
-      }
-      
-      // 检查房间是否已满
-      if (result.is_room_full) {
-        showToast('当前房间人数已满，正在传输中无法加入，请稍后再试', "error");
-        return;
-      }
-      
-      // 检查发送方是否在线
-      if (!result.sender_online) {
-        showToast('发送方不在线，请确认房间代码是否正确或联系发送方', "error");
+        showToast(result.error || '房间验证失败', "error");
         return;
       }
       
@@ -94,26 +73,11 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
       showToast('已加入桌面共享', 'success');
     } catch (error) {
       console.error('[DesktopShareReceiver] 加入观看失败:', error);
-      
-      let errorMessage = '加入观看失败';
-      if (error instanceof Error) {
-        if (error.message.includes('network') || error.message.includes('fetch')) {
-          errorMessage = '网络连接失败，请检查网络状况';
-        } else if (error.message.includes('timeout')) {
-          errorMessage = '请求超时，请重试';
-        } else if (error.message.includes('HTTP 404')) {
-          errorMessage = '房间不存在，请检查房间代码';
-        } else if (error.message.includes('HTTP 500')) {
-          errorMessage = '服务器错误，请稍后重试';
-        } else {
-          errorMessage = error.message;
-        }
-      }
-      
+      const errorMessage = error instanceof Error ? handleNetworkError(error) : '加入观看失败';
       showToast(errorMessage, 'error');
     } finally {
       setIsLoading(false);
-      setIsJoiningRoom(false); // 重置加入房间状态
+      setIsJoiningRoom(false);
     }
   }, [desktopShare, inputCode, isJoiningRoom, showToast]);
 
@@ -132,6 +96,26 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
     }
   }, [desktopShare, showToast]);
 
+  // 监听发送方退出：当正在观看时检测到错误为"对方已退出共享"
+  useEffect(() => {
+    if (desktopShare.isViewing && desktopShare.webRTCError === '对方已退出共享') {
+      console.log('[DesktopShareReceiver] 检测到发送方已退出共享');
+      setShowPeerLeftDialog(true);
+    }
+  }, [desktopShare.isViewing, desktopShare.webRTCError]);
+
+  // 确认发送方退出后回到初始页面
+  const handlePeerLeftConfirm = useCallback(async () => {
+    setShowPeerLeftDialog(false);
+    try {
+      await desktopShare.stopViewing();
+    } catch {
+      // ignore
+    }
+    setInputCode('');
+    hasTriedAutoJoin.current = false;
+  }, [desktopShare]);
+
   // 如果有初始代码且还未加入观看，自动尝试加入
   React.useEffect(() => {
     console.log('[WebRTCDesktopReceiver] useEffect 触发, 参数:', {
@@ -148,8 +132,9 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
         const trimmedCode = initialCode.trim();
         
         // 检查房间代码格式
-        if (!trimmedCode || trimmedCode.length !== 6) {
-          showToast('房间代码格式不正确', "error");
+        const validationError = validateRoomCode(trimmedCode);
+        if (validationError) {
+          showToast(validationError, "error");
           return;
         }
         
@@ -157,36 +142,11 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
         console.log('[WebRTCDesktopReceiver] 检测到初始代码，开始验证并自动加入:', trimmedCode);
         
         try {
-          // 先检查房间状态
           console.log('[WebRTCDesktopReceiver] 验证房间状态...');
-          const response = await fetch(`/api/room-info?code=${trimmedCode}`);
-          
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: 无法检查房间状态`);
-          }
-          
-          const result = await response.json();
+          const result = await checkRoomStatus(trimmedCode);
           
           if (!result.success) {
-            let errorMessage = result.message || '房间不存在或已过期';
-            if (result.message?.includes('expired')) {
-              errorMessage = '房间已过期，请联系发送方重新创建';
-            } else if (result.message?.includes('not found')) {
-              errorMessage = '房间不存在，请检查房间代码是否正确';
-            }
-            showToast(errorMessage, "error");
-            return;
-          }
-          
-          // 检查房间是否已满
-          if (result.is_room_full) {
-            showToast('当前房间人数已满，正在传输中无法加入，请稍后再试', "error");
-            return;
-          }
-          
-          // 检查发送方是否在线
-          if (!result.sender_online) {
-            showToast('发送方不在线，请确认房间代码是否正确或联系发送方', "error");
+            showToast(result.error || '房间验证失败', "error");
             return;
           }
           
@@ -198,22 +158,7 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
           showToast('已加入桌面共享', 'success');
         } catch (error) {
           console.error('[WebRTCDesktopReceiver] 自动加入观看失败:', error);
-          
-          let errorMessage = '自动加入观看失败';
-          if (error instanceof Error) {
-            if (error.message.includes('network') || error.message.includes('fetch')) {
-              errorMessage = '网络连接失败，请检查网络状况';
-            } else if (error.message.includes('timeout')) {
-              errorMessage = '请求超时，请重试';
-            } else if (error.message.includes('HTTP 404')) {
-              errorMessage = '房间不存在，请检查房间代码';
-            } else if (error.message.includes('HTTP 500')) {
-              errorMessage = '服务器错误，请稍后重试';
-            } else {
-              errorMessage = error.message;
-            }
-          }
-          
+          const errorMessage = error instanceof Error ? handleNetworkError(error) : '自动加入观看失败';
           showToast(errorMessage, 'error');
         } finally {
           setIsLoading(false);
@@ -262,7 +207,7 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
                   <div className="relative">
                     <Input
                       value={inputCode}
-                      onChange={(e) => setInputCode(e.target.value.replace(/[^123456789ABCDEFGHIJKLMNPQRSTUVWXYZabcdefghijklmnpqrstuvwxyz]/g, ''))}
+                      onChange={(e) => setInputCode(e.target.value.replace(/[^123456789ABCDEFGHIJKLMNPQRSTUVWXYZabcdefghijklmnpqrstuvwxyz]/g, '').toUpperCase())}
                       placeholder="请输入房间代码"
                       className="text-center text-2xl sm:text-3xl tracking-[0.3em] sm:tracking-[0.5em] font-mono h-12 sm:h-16 border-2 border-slate-200 rounded-xl focus:border-purple-500 focus:ring-purple-500 bg-white/80 backdrop-blur-sm pb-2 sm:pb-4"
                       maxLength={6}
@@ -339,6 +284,14 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
                 </div>
               </div>
 
+              {/* 语音通话面板 */}
+              {desktopShare.webRTCConnection && (
+                <VoiceChatPanel
+                  connection={desktopShare.webRTCConnection}
+                  isPeerConnected={desktopShare.isPeerConnected}
+                />
+              )}
+
               {/* 桌面显示区域 */}
               {desktopShare.remoteStream ? (
                 <DesktopViewer
@@ -347,6 +300,15 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
                   connectionCode={inputCode}
                   onDisconnect={handleStopViewing}
                 />
+              ) : desktopShare.webRTCConnection?.transportMode === 'relay' ? (
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-8">
+                  <div className="text-center">
+                    <Monitor className="w-16 h-16 mx-auto text-amber-400 mb-4" />
+                    <p className="text-amber-700 font-medium mb-2">⚠️ 当前为中继模式</p>
+                    <p className="text-sm text-amber-600">中继模式（WS 转发）不支持桌面视频流传输，桌面共享需要 P2P 直连。</p>
+                    <p className="text-sm text-amber-600 mt-1">请检查网络环境或尝试重新连接。</p>
+                  </div>
+                </div>
               ) : (
                 <div className="bg-white/80 backdrop-blur-sm rounded-xl p-8 border border-slate-200">
                   <div className="text-center">
@@ -365,6 +327,18 @@ export default function WebRTCDesktopReceiver({ className, initialCode, onConnec
           )}
         </div>
       </div>
+
+      {/* 发送方退出提示对话框 */}
+      <ConfirmDialog
+        isOpen={showPeerLeftDialog}
+        onClose={handlePeerLeftConfirm}
+        onConfirm={handlePeerLeftConfirm}
+        title="共享已结束"
+        message="对方已停止桌面共享，点击确认返回。"
+        confirmText="确认"
+        cancelText="确认"
+        type="info"
+      />
     </div>
   );
 }

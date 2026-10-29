@@ -4,6 +4,10 @@ export interface FileInfo {
   name: string;
   size: number;
   type: string;
+  status: 'ready' | 'downloading' | 'completed';
+  progress: number;
+  speed?: number;        // 传输速度 bytes/s
+  eta?: number;          // 预估剩余时间 秒
   lastModified?: number;
 }
 
@@ -29,23 +33,4 @@ export interface RoomStatus {
     user_agent: string;
   }[];
   created_at: string;
-}
-
-export interface FileChunk {
-  offset: number;
-  data: Uint8Array;
-}
-
-export interface WebSocketMessage {
-  type: string;
-  payload: Record<string, unknown>;
-}
-
-// WebSocket 钩子状态
-export interface UseWebSocketReturn {
-  websocket: WebSocket | null;
-  isConnected: boolean;
-  connect: (code: string, role: 'sender' | 'receiver') => void;
-  disconnect: () => void;
-  sendMessage: (message: WebSocketMessage) => void;
 }

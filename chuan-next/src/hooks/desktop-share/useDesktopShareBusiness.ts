@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import type { WebRTCConnection } from '../connection/types';
 import { useSharedWebRTCManager } from '../connection/useSharedWebRTCManager';
 
 interface DesktopShareState {
@@ -6,17 +7,20 @@ interface DesktopShareState {
   isViewing: boolean;
   connectionCode: string;
   remoteStream: MediaStream | null;
+  localStream: MediaStream | null;
   error: string | null;
   isWaitingForPeer: boolean;  // 新增：是否等待对方连接
 }
 
-export function useDesktopShareBusiness() {
-  const webRTC = useSharedWebRTCManager();
+export function useDesktopShareBusiness(externalConnection?: WebRTCConnection) {
+  const internalConnection = useSharedWebRTCManager();
+  const webRTC = externalConnection ?? internalConnection;
   const [state, setState] = useState<DesktopShareState>({
     isSharing: false,
     isViewing: false,
     connectionCode: '',
     remoteStream: null,
+    localStream: null,
     error: null,
     isWaitingForPeer: false,
   });
@@ -40,24 +44,22 @@ export function useDesktopShareBusiness() {
     }
   }, [updateState]);
 
-  // 设置远程轨道处理器（始终监听）
+  // 设置远程轨道处理器（始终监听，支持与语音通话并存）
+  const registerTrackHandler = webRTC.registerTrackHandler;
   useEffect(() => {
-    console.log('[DesktopShare] 🎧 设置远程轨道处理器');
-    webRTC.onTrack((event: RTCTrackEvent) => {
-      console.log('[DesktopShare] 🎥 收到远程轨道:', event.track.kind, event.track.id, '状态:', event.track.readyState);
-      console.log('[DesktopShare] 远程流数量:', event.streams.length);
+    const unsubscribe = registerTrackHandler('desktop-share', (event: RTCTrackEvent) => {
+      // 只处理视频轨道，音频由 VoiceChat 处理
+      if (event.track.kind !== 'video') return;
+
+      console.log('[DesktopShare] 🎥 收到远程视频轨道:', event.track.id, '状态:', event.track.readyState);
       
       if (event.streams.length > 0) {
         const remoteStream = event.streams[0];
         console.log('[DesktopShare] 🎬 设置远程流，轨道数量:', remoteStream.getTracks().length);
-        remoteStream.getTracks().forEach(track => {
-          console.log('[DesktopShare] 远程轨道:', track.kind, track.id, '启用:', track.enabled, '状态:', track.readyState);
-        });
         
         // 确保轨道已启用
         remoteStream.getTracks().forEach(track => {
           if (!track.enabled) {
-            console.log('[DesktopShare] 🔓 启用远程轨道:', track.id);
             track.enabled = true;
           }
         });
@@ -65,26 +67,19 @@ export function useDesktopShareBusiness() {
         handleRemoteStream(remoteStream);
       } else {
         console.warn('[DesktopShare] ⚠️ 收到轨道但没有关联的流');
-        // 尝试从轨道创建流
         try {
           const newStream = new MediaStream([event.track]);
-          console.log('[DesktopShare] 🔄 从轨道创建新流:', newStream.id);
-          
-          // 确保轨道已启用
           newStream.getTracks().forEach(track => {
-            if (!track.enabled) {
-              console.log('[DesktopShare] 🔓 启用新流中的轨道:', track.id);
-              track.enabled = true;
-            }
+            if (!track.enabled) track.enabled = true;
           });
-          
           handleRemoteStream(newStream);
         } catch (error) {
           console.error('[DesktopShare] ❌ 从轨道创建流失败:', error);
         }
       }
     });
-  }, [webRTC, handleRemoteStream]);
+    return unsubscribe;
+  }, [registerTrackHandler, handleRemoteStream]);
 
   // 获取桌面共享流
   const getDesktopStream = useCallback(async (): Promise<MediaStream> => {
@@ -273,6 +268,11 @@ export function useDesktopShareBusiness() {
   // 开始桌面共享（在接收方加入后）
   const startSharing = useCallback(async (): Promise<void> => {
     try {
+      // 中继模式不支持媒体流传输
+      if (webRTC.transportMode === 'relay') {
+        throw new Error('当前为中继模式，不支持桌面共享。桌面共享需要 P2P 直连，请检查网络环境后重试');
+      }
+
       // 检查P2P连接状态（与switchDesktop保持一致）
       if (!webRTC.isPeerConnected) {
         throw new Error('P2P连接未建立');
@@ -299,6 +299,7 @@ export function useDesktopShareBusiness() {
       updateState({
         isSharing: true,
         isWaitingForPeer: false,
+        localStream: stream,
       });
 
       console.log('[DesktopShare] 🎉 桌面共享已开始');
@@ -320,6 +321,10 @@ export function useDesktopShareBusiness() {
   // 切换桌面共享（重新选择屏幕）
   const switchDesktop = useCallback(async (): Promise<void> => {
     try {
+      if (webRTC.transportMode === 'relay') {
+        throw new Error('当前为中继模式，不支持桌面共享');
+      }
+
       if (!webRTC.isPeerConnected) {
         throw new Error('P2P连接未建立');
       }
@@ -345,6 +350,8 @@ export function useDesktopShareBusiness() {
       // 设置新的视频发送
       await setupVideoSending(newStream);
       console.log('[DesktopShare] ✅ 桌面切换完成');
+
+      updateState({ localStream: newStream });
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : '切换桌面失败';
@@ -380,6 +387,7 @@ export function useDesktopShareBusiness() {
       updateState({
         isSharing: false,
         connectionCode: '',
+        localStream: null,
         error: null,
         isWaitingForPeer: false,
       });
@@ -415,6 +423,7 @@ export function useDesktopShareBusiness() {
       // 保留WebSocket连接和房间代码，但重置共享状态
       updateState({
         isSharing: false,
+        localStream: null,
         error: null,
         isWaitingForPeer: false,
       });
@@ -515,14 +524,17 @@ export function useDesktopShareBusiness() {
     isViewing: state.isViewing,
     connectionCode: state.connectionCode,
     remoteStream: state.remoteStream,
+    localStream: state.localStream,
     error: state.error,
     isWaitingForPeer: state.isWaitingForPeer,
     isConnected: webRTC.isConnected,
     isConnecting: webRTC.isConnecting,
     isWebSocketConnected: webRTC.isWebSocketConnected,
     isPeerConnected: webRTC.isPeerConnected,
-    // 新增：表示是否可以开始共享（WebSocket已连接且有房间代码）
-    canStartSharing: webRTC.isWebSocketConnected && !!state.connectionCode,
+    // 新增：表示是否可以开始共享（WebSocket已连接且有房间代码且非中继模式）
+    canStartSharing: webRTC.isWebSocketConnected && !!state.connectionCode && webRTC.transportMode !== 'relay',
+    // 传输模式
+    transportMode: webRTC.transportMode,
 
     // 方法
     createRoom,        // 创建房间
